@@ -1,89 +1,133 @@
-import numpy as np
 import cv2
+import numpy as np
+from pathlib import Path
 
-# Read the input video
-cap = cv2.VideoCapture('hand.mp4')
 
-# take first frame of the
-# video
-ret, frame = cap.read()
+class CAMShiftTracker(object):
 
-# setup initial region of
-# tracker
-x, y, width, height = 400, 440, 150, 150
-track_window = (x, y,  width, height)
+    def __init__(self, curWindowRoi, imgBGR):
+        '''
+        curWindow =[x,y, w,h] // initialize the window to be tracked by the tracker
+        '''
+        self.updateCurrentWindow(curWindowRoi)
+        self.updateHistograms(imgBGR)
 
-# set up the Region of
-# Interest for tracking
+        # set up the termination criteria for meanshift, either 10 iterations or move by at least 1 pt
+        self.term_criteria = (cv2.TERM_CRITERIA_EPS |
+                              cv2.TERM_CRITERIA_COUNT, 10, 1)
 
-# convert ROI from BGR to
-# HSV format
-roi = cv2.selectROI("Tracking", frame, False)
+    def updateCurrentWindow(self,  curWindowRoi):
 
-bgrObjectRoi = frame[roi[1]: roi[1] + roi[3],
-                     roi[0]: roi[0] + roi[2]] 
+        self.curWindow = curWindowRoi
 
-hsv_roi = cv2.cvtColor(bgrObjectRoi, cv2.COLOR_BGR2HSV)
+    def updateHistograms(self, imgBGR):
+        '''
+          update the histogram and rois according to the current object in the current image
 
-# perform masking operation
-mask = cv2.inRange(hsv_roi, np.array((0., 50., 50.)), np.array((180., 255., 255)))
+        '''
 
-roi_hist = cv2.calcHist([hsv_roi],
-                       [0], mask,
-                       [180],
-                       [0, 180])
+        self.bgrObjectRoi = imgBGR[self.curWindow[1]: self.curWindow[1] + self.curWindow[3],
+                                   self.curWindow[0]: self.curWindow[0] + self.curWindow[2]]
+        self.hsvObjectRoi = cv2.cvtColor(self.bgrObjectRoi, cv2.COLOR_BGR2HSV)
 
-cv2.normalize(roi_hist, roi_hist,
-             0, 255, cv2.NORM_MINMAX)
+        # get the mask for calculating histogram and also remove some noise
+        self.mask = cv2.inRange(self.hsvObjectRoi,
+                                np.array((0., 50., 50.)),
+                                np.array((180, 255., 255.)))
 
-# Setup the termination criteria,
-# either 15 iteration or move by
-# atleast 2 pt
-term_crit = (cv2.TERM_CRITERIA_EPS |
-             cv2.TERM_CRITERIA_COUNT, 15, 2)
+        # use 180 bins for each H value, and normalize the histogram to lie b/w [0, 255]
+        self.histObjectRoi = cv2.calcHist(
+            [self.hsvObjectRoi], [0], self.mask, [180], [0, 180])
+        cv2.normalize(self.histObjectRoi, self.histObjectRoi,
+                      0, 255, cv2.NORM_MINMAX)
+
+    def getBackProjectedImage(self, imgBGR):
+        '''
+           convert the current BGR image, imgBGR, to HSV color space
+           and return the backProjectedImg
+        '''
+        # print("[info] getBackprjectImage calls", imgBGR.shape)
+        imgHSV = cv2.cvtColor(imgBGR, cv2.COLOR_BGR2HSV)
+
+        # obtained the back projected image using the histogram obtained earlier
+
+        backProjectedImg = cv2.calcBackProject(
+            [imgHSV], [0], self.histObjectRoi, [0, 180], 1)
+
+        self.backProjectedImg = backProjectedImg
+
+        return backProjectedImg.copy()
+
+    def computeNewWindow(self, imgBGR):
+        '''
+            Track the window enclosing the object of interest using CAMShift function of openCV for the
+            current frame imgBGR
+        '''
+
+        self.getBackProjectedImage(imgBGR)
+
+        self.rotatedWindow, curWindow = cv2.CamShift(
+            self.backProjectedImg, self.curWindow, self.term_criteria)
+
+        # get the rotated windo vertices
+
+        self.rotatedWindow = cv2.boxPoints(self.rotatedWindow)
+        self.rotatedWindow = np.int0(self.rotatedWindow)
+
+        self.updateCurrentWindow(curWindow)
+
+    def getCurWindow(self):
+
+        return self.curWindow
+
+    def getRotatedWindow(self):
+
+        return self.rotatedWindow
+
+# paths
+CURRENT_DIR = Path(__file__).parent
+MEDIA_DIR = CURRENT_DIR.parent / Path("media")
+
+# Load the video
+video = cv2.VideoCapture("hand.mp4")
+
+# Initialize the KCF tracker
+
+# Read the first frame
+ok, frame = video.read()
+
+# Initialize the bounding box of the object to track
+bbox = cv2.selectROI("Tracking", frame, False)
+
+# Start the tracking process
+camShifTracker = CAMShiftTracker(bbox, frame)
 
 while True:
-    ret, frame = cap.read()
+    ok, frame = video.read()
+    if not ok:
+        break
 
-    # Resize the video frames.
-    frame = cv2.resize(frame, (720, 720), fx=0, fy=0, interpolation=cv2.INTER_CUBIC)
+    timer = cv2.getTickCount()
+    camShifTracker.computeNewWindow(frame)
+    fps = cv2.getTickFrequency() / (cv2.getTickCount() - timer)
 
-    cv2.imshow('Original', frame)
+    x, y, w, h = camShifTracker.getCurWindow()
 
-    # perform thresholding on
-    # the video frames
-    ret1, frame1 = cv2.threshold(frame, 180, 155, cv2.THRESH_TOZERO_INV)
+    # display the current window
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2, cv2.LINE_AA)
 
-    # convert from BGR to HSV
-    # format.
-    hsv = cv2.cvtColor(frame1,
-                      cv2.COLOR_BGR2HSV)
+    rotatedWindow = camShifTracker.getRotatedWindow()
+    # display rotated window
+    #cv2.polylines(frame, [rotatedWindow], True,
+                 #(0, 255, 0), 2, cv2.LINE_AA)
 
-    dst = cv2.calcBackProject([hsv], [0], roi_hist, [0, 180], 1)
-
-    # apply Camshift to get the
-    # new location
-    ret2, track_window = cv2.CamShift(dst, track_window, term_crit)
-
-    # Draw it on image
-    pts = cv2.boxPoints(ret2)
-
-    # convert from floating
-    # to integer
-    pts = np.int0(pts)
-
-    # Draw Tracking window on the
-    # video frame.
-    Result = cv2.polylines(frame, [pts], True, (255, 255, 255), 2)
-
-    cv2.imshow('Camshift', Result)
-
-    # set ESC key as the
-    # exit button.
-    k = cv2.waitKey(30) & 0xff
-
+    cv2.putText(frame, "FPS : " + str(int(fps)), (100, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (50, 170, 50), 2)
+# show the frame and update the FPS counter
+    cv2.imshow("CAMShift Face Tracking", frame)
+    k = cv2.waitKey(1) & 0xff
     if k == 27:
         break
 # Release the video and destroy windows
-cap.release()
+video.release()
 cv2.destroyAllWindows()
